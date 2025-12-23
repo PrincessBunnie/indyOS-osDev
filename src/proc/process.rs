@@ -617,6 +617,170 @@ impl Scheduler {
             );
         }
     }
+    pub fn run_current_process_debug(&mut self) -> ! {
+        let process = self.schedule().expect("No process to run!");
+        serial_println!("\nScheduled a process to run");
+
+        let stack_pointer = process.setup_stack(
+            &["init"],
+            &[],
+            vec![(6, 4096), (0, 0)],
+        ).expect("Failed to setup stack");
+
+        process.cpu_state_mut().rsp = stack_pointer;
+
+        serial_println!("\nStack has been setup with stack pointer: {}", stack_pointer);
+
+        let kernel_stack_top = process.kernel_stack_top();
+        let kernel_stack_ptr = kernel_stack_top.as_u64() - 16;
+        let page_table_addr = process.page_table_addr();
+
+        unsafe {
+            crate::syscalls::management::CURRENT_KERNEL_RSP = kernel_stack_ptr;
+            crate::memory::segmentation::set_kernel_stack(VirtAddr::new(kernel_stack_ptr));
+        }
+
+        let entry_point = process.cpu_state().rip;
+        let user_stack = stack_pointer;
+
+        serial_println!("About to enter userspace via sysret path");
+        serial_println!("  Entry: {:#x}", entry_point);
+        serial_println!("  Stack: {:#x}", user_stack);
+
+        serial_println!("\n=== MEMORY LAYOUT DEBUG ===");
+        serial_println!("Entry point code disassembly shows:");
+        serial_println!("  400000: b8 01 00 00 00  mov eax, 1");
+        serial_println!("  400005: bf 01 00 00 00  mov edi, 1");
+        serial_println!("  40000a: ba 15 00 00 00  mov edx, 0x15");
+        serial_println!("  40000f: 48 c7 c6...     mov rsi, 0x601000");
+        serial_println!("  400016: 0f 05           syscall  <-- FIRST SYSCALL");
+
+        let page_table = unsafe {
+            crate::memory::page::page_table_from_addr(page_table_addr)
+        };
+
+        // check entry point
+        serial_println!("\nChecking user code at 0x400000:");
+        match page_table.translate_addr(VirtAddr::new(0x400000)) {
+            Some(phys) => {
+                let kva = crate::memory::page::phys_offset().as_u64() + phys.as_u64();
+                let code = unsafe { core::slice::from_raw_parts(kva as *const u8, 32) };
+                serial_print!("  Bytes: ");
+                for i in 0..32 {
+                    serial_print!("{:02x} ", code[i]);
+                    if i == 15 { serial_println!(); serial_print!("         "); }
+                }
+                serial_println!();
+
+                if code[0] == 0xb8 && code[22] == 0x0f && code[23] == 0x05 {
+                    serial_println!("  Matches expected: mov eax,1; ...; syscall");
+                } else {
+                    serial_println!("  Mismatch! Code not loaded correctly!");
+                }
+            }
+            None => serial_println!("  NOT MAPPED!"),
+        }
+
+        // Check data section
+        serial_println!("\nChecking user data at 0x601000:");
+        match page_table.translate_addr(VirtAddr::new(0x601000)) {
+            Some(phys) => {
+                let kva = phys_offset().as_u64() + phys.as_u64();
+                let data = unsafe { core::slice::from_raw_parts(kva as *const u8, 32) };
+                serial_print!("  Bytes: ");
+                for i in 0..32 { serial_print!("{:02x} ", data[i]); }
+                serial_println!();
+
+                // Try to interpret as ASCII
+                serial_print!("  ASCII: ");
+                for i in 0..32 {
+                    let c = data[i];
+                    if c >= 32 && c < 127 {
+                        serial_print!("{}", c as char);
+                    } else {
+                        serial_print!(".");
+                    }
+                }
+                serial_println!();
+            }
+            None => serial_println!("  NOT MAPPED!"),
+        }
+
+        // Check syscall handler
+        let handler_addr = unsafe {
+            crate::syscalls::management::syscall_entry as *const () as u64
+        };
+        serial_println!("\nChecking syscall handler at {:#x}:", handler_addr);
+        match page_table.translate_addr(VirtAddr::new(handler_addr)) {
+            Some(phys) => {
+                serial_println!("  Mapped to phys {:#x}", phys.as_u64());
+                let kva = phys_offset().as_u64() + phys.as_u64();
+                let code = unsafe { core::slice::from_raw_parts(kva as *const u8, 4) };
+                serial_print!("  First bytes: ");
+                for i in 0..4 { serial_print!("{:02x} ", code[i]); }
+                serial_println!();
+
+                if code[0] == 0x0f && code[1] == 0x0b {
+                    serial_println!("  Looks good: starts with UD2 (0f 0b)!");
+                } else {
+                    serial_println!("  Doesn't start with UD2");
+                }
+            }
+            None => serial_println!("  NOT MAPPED! syscall will triple fault!"),
+        }
+
+        serial_println!("===========================\n");
+
+        unsafe {
+            core::arch::asm!(
+            // 1: Load entry point and stack into the registers first
+            "mov rcx, {rip}",        // RCX = user RIP (sysret)
+            "mov r11, 0x202",        // R11 = user RFLAGS (sysret)
+
+            // 2: Now switch to kernel stack
+            "mov rsp, {kernel_stack}",
+
+            // 3: Switch page table (CR3)
+            "mov rax, {page_table}",
+            "mov cr3, rax",
+
+            // 4: Load user stack into rsp
+            // saved the user stack value in a temporary because we needed
+            // to use rsp for the kernel stack first
+            "mov rsp, {user_rsp}",
+
+            // 5: Clear all other registers for security bc why not
+            "xor rax, rax",
+            "xor rbx, rbx",
+            "xor rdx, rdx",
+            "xor rsi, rsi",
+            "xor rdi, rdi",
+            "xor rbp, rbp",
+            "xor r8, r8",
+            "xor r9, r9",
+            "xor r10, r10",
+            "xor r12, r12",
+            "xor r13, r13",
+            "xor r14, r14",
+            "xor r15, r15",
+
+            // 6: Jump to userspace
+            // should have:
+            // - RCX = user RIP (0x400000)
+            // - R11 = user RFLAGS (0x202)
+            // - RSP = user stack (0x7fffffffefb0)
+            // - CS will be set to 0x23 (user code, RPL=3)
+            // - SS will be set to 0x1b (user data, RPL=3)
+            "sysretq",
+
+            kernel_stack = in(reg) kernel_stack_ptr,
+            page_table = in(reg) page_table_addr.as_u64(),
+            rip = in(reg) entry_point,
+            user_rsp = in(reg) user_stack,
+            options(noreturn)
+            );
+        }
+    }
     pub fn current_process_mut(&mut self) -> Option<&mut Box<Process>> {
         let pid = self.current?;
         self.processes.iter_mut().find(|p| p.pid == pid)
